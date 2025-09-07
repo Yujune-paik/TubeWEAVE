@@ -1,26 +1,76 @@
-@import "tailwindcss";
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
 
-:root {
-  --background: #ffffff;
-  --foreground: #171717;
-}
+@layer base {
+  * {
+    @apply border-white/10;
+  }
 
-@theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
+  body {
+    @apply bg-black text-white antialiased;
+    font-feature-settings: "rlig" 1, "calt" 1;
   }
 }
 
-body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+@layer components {
+  .glass-card {
+    @apply bg-black/40 backdrop-blur-xl border border-white/10 rounded-2xl;
+  }
+
+  .glass-card-hover {
+    @apply hover:bg-black/60 hover:border-white/20 transition-all duration-300;
+  }
+
+  .input-field {
+    @apply bg-black/60 border border-white/20 rounded-lg px-3 py-2 text-white placeholder-white/50 focus:border-white/40 focus:ring-2 focus:ring-white/20 transition-all duration-200;
+  }
+
+  .button-primary {
+    @apply bg-gradient-to-r from-white/10 to-white/5 border border-white/20 rounded-xl px-4 py-2 text-white hover:from-white/20 hover:to-white/10 hover:border-white/30 transition-all duration-200 active:scale-95;
+  }
+
+  .button-secondary {
+    @apply bg-black/60 border border-white/20 rounded-xl px-4 py-2 text-white/80 hover:bg-black/80 hover:border-white/30 hover:text-white transition-all duration-200 active:scale-95;
+  }
+
+  .canvas-container {
+    @apply bg-black/20 border border-white/10 rounded-2xl p-4 backdrop-blur-sm;
+  }
+
+  .control-panel {
+    @apply glass-card glass-card-hover p-6 space-y-4;
+  }
+
+  .section-title {
+    @apply text-lg font-semibold text-white/90 mb-4 flex items-center gap-2;
+  }
+
+  .metric-display {
+    @apply text-xs text-white/60 bg-black/40 px-2 py-1 rounded-md border border-white/10;
+  }
+
+  .slider {
+    background: linear-gradient(to right, #ffffff20 0%, #ffffff20 var(--value, 0%), #ffffff10 var(--value, 0%), #ffffff10 100%);
+  }
+
+  .slider::-webkit-slider-thumb {
+    appearance: none;
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    background: #ffffff;
+    cursor: pointer;
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.3);
+  }
+
+  .slider::-moz-range-thumb {
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    background: #ffffff;
+    cursor: pointer;
+    border: none;
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.3);
+  }
 }
