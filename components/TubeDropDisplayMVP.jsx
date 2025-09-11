@@ -26,6 +26,113 @@ const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
 const mmToPx = (mm, mmPerPixel) => mm / mmPerPixel;
 const pxToMm = (px, mmPerPixel) => px * mmPerPixel;
 
+// EHD parameter mapping functions
+// CSV values: dense(80,70,0,1500,0.135), sparse(73,70,0,2000,0.05)
+const DENSE_PARAMS = { ch0: 80, ch1: 70, ch2: 0, duration_base: 1500, resistance_factor: 0.135 };
+const SPARSE_PARAMS = { ch0: 73, ch1: 70, ch2: 0, duration_base: 2000, resistance_factor: 0.05 };
+
+// Convert density level (1-10) to EHD parameters using linear interpolation
+const densityLevelToEHDParams = (densityLevel, calibration = null) => {
+  const level = clamp(densityLevel, 1, 10);
+  const ratio = (level - 1) / 9; // 0-1に正規化 (1→0, 10→1)
+
+  // Use calibration params if provided, otherwise use defaults
+  const denseParams = calibration ? {
+    ch0: calibration.denseCh0,
+    ch1: calibration.ch1,
+    ch2: 0,
+    duration_base: calibration.denseDuration,
+    resistance_factor: calibration.denseResistance
+  } : DENSE_PARAMS;
+
+  const sparseParams = calibration ? {
+    ch0: calibration.sparseCh0,
+    ch1: calibration.ch1,
+    ch2: 0,
+    duration_base: calibration.sparseDuration,
+    resistance_factor: calibration.sparseResistance
+  } : SPARSE_PARAMS;
+
+  return {
+    ch0: Math.round(lerp(sparseParams.ch0, denseParams.ch0, ratio)),
+    ch1: denseParams.ch1, // 共通値
+    ch2: denseParams.ch2, // 共通値
+    duration_base: Math.round(lerp(sparseParams.duration_base, denseParams.duration_base, ratio)),
+    resistance_factor: lerp(sparseParams.resistance_factor, denseParams.resistance_factor, ratio)
+  };
+};
+
+// Convert segments to EHD steps with resistance accumulation
+const segmentsToEHDSteps = (segments, feedSpeedMmPerSec = 10, maxSteps = 50, calibration = null) => {
+  if (!segments || segments.length === 0) return [];
+
+  // Sort segments by start position
+  const sortedSegments = [...segments].sort((a, b) => a.startCm - b.startCm);
+
+  let cumulativeResistance = 0;
+  const steps = [];
+
+  for (let i = 0; i < sortedSegments.length && steps.length < maxSteps; i++) {
+    const seg = sortedSegments[i];
+    const ehdParams = densityLevelToEHDParams(seg.densityLevel, calibration);
+
+    // Calculate duration based on segment length and feed speed
+    const segmentLengthMm = (seg.endCm - seg.startCm) * 10; // cm to mm
+    const baseDurationMs = (segmentLengthMm / feedSpeedMmPerSec) * 1000;
+
+    // Apply resistance accumulation (like original Processing code)
+    const adjustedDuration = Math.round(baseDurationMs * (1 + cumulativeResistance));
+
+    // Add resistance factor to cumulative sum
+    cumulativeResistance += ehdParams.resistance_factor;
+
+    steps.push({
+      ch0: ehdParams.ch0,
+      ch1: ehdParams.ch1,
+      duration: adjustedDuration
+    });
+  }
+
+  return steps;
+};
+
+// Check if two segments overlap
+const segmentsOverlap = (seg1, seg2) => {
+  return seg1.startCm < seg2.endCm && seg2.startCm < seg1.endCm;
+};
+
+// Find the next available position for a new segment
+const findNextAvailablePosition = (segments, preferredStart, preferredLength, tubeLength) => {
+  const sortedSegments = [...segments].sort((a, b) => a.startCm - b.startCm);
+
+  // Try the preferred position first
+  const preferredEnd = preferredStart + preferredLength;
+  if (preferredEnd <= tubeLength) {
+    const newSegment = { startCm: preferredStart, endCm: preferredEnd };
+    const hasOverlap = sortedSegments.some(seg => segmentsOverlap(seg, newSegment));
+    if (!hasOverlap) {
+      return { startCm: preferredStart, endCm: preferredEnd };
+    }
+  }
+
+  // Find gaps between existing segments
+  let currentPos = 0;
+  for (const seg of sortedSegments) {
+    if (currentPos + preferredLength <= seg.startCm) {
+      return { startCm: currentPos, endCm: currentPos + preferredLength };
+    }
+    currentPos = seg.endCm;
+  }
+
+  // Try at the end
+  if (currentPos + preferredLength <= tubeLength) {
+    return { startCm: currentPos, endCm: currentPos + preferredLength };
+  }
+
+  // If no space available, return null
+  return null;
+};
+
 function catmullRom(p0, p1, p2, p3, t) {
   // Catmull-Rom with tension=0.5 (centripetal variant would need different parameterization)
   const t2 = t * t;
@@ -416,6 +523,16 @@ function generateParallelPattern(startPoint, endPoint, params) {
   return points;
 }
 
+// Helper to build a folded path with fixed 15cm margins top/bottom/left/right
+function generateParallelWithMargins(startPoint, endPoint, params, mmPerPixel, physicalUnits) {
+  // 15cm = 150mm → px
+  const marginPx = mmToPx(150, mmPerPixel);
+  // Constrain start/end inside margins box
+  const start = { x: Math.max(startPoint.x, marginPx), y: Math.max(startPoint.y, marginPx) };
+  const end = { x: Math.min(endPoint.x, mmToPx(physicalUnits.canvasWidthMm, mmPerPixel) - marginPx), y: Math.min(endPoint.y, mmToPx(physicalUnits.canvasHeightMm, mmPerPixel) - marginPx) };
+  return generateParallelPattern(start, end, params);
+}
+
 function generateWavePattern(startPoint, endPoint, params) {
   const { spacing, amplitude, frequency } = params;
   const points = [];
@@ -453,16 +570,8 @@ function generateWavePattern(startPoint, endPoint, params) {
 }
 
 function generatePatternPoints(patternType, startPoint, endPoint, params) {
-  switch (patternType) {
-    case 'zigzag':
-      return generateZigzagPattern(startPoint, endPoint, params);
-    case 'parallel':
+  // Only parallel is supported now; ignore others
       return generateParallelPattern(startPoint, endPoint, params);
-    case 'wave':
-      return generateWavePattern(startPoint, endPoint, params);
-    default:
-      return [];
-  }
 }
 
 // ---------- Main Component ----------
@@ -478,6 +587,7 @@ export default function TubeDropDisplayMVP() {
   const mainCanvasRef = useRef(null);
   const offscreenRef = useRef(null); // offscreen for image/text
   const tubeVisualizationRef = useRef(null); // for tube visualization
+  const manualEditorRef = useRef(null); // for direct schedule editor
 
   const [canvasW, setCanvasW] = useState(900);
   const [canvasH, setCanvasH] = useState(600);
@@ -516,16 +626,13 @@ export default function TubeDropDisplayMVP() {
 
   // Pattern system
   const [patternMode, setPatternMode] = useState(false); // Enable pattern mode
-  const [selectedPatternType, setSelectedPatternType] = useState('zigzag'); // 'zigzag', 'parallel', 'wave'
+  const [selectedPatternType, setSelectedPatternType] = useState('parallel'); // keep only 'parallel'
   const [patternStartPoint, setPatternStartPoint] = useState(null); // { x, y } or null
   const [patternEndPoint, setPatternEndPoint] = useState(null); // { x, y } or null
   const [patternParams, setPatternParams] = useState({
-    topFolds: 5, // Number of folds at the top
-    bottomFolds: 5, // Number of folds at the bottom
-    tubeWidth: 4, // Smaller tube width for smoother curves
-    spacing: 8, // Smaller spacing for more points
-    amplitude: 20,
-    frequency: 0.1
+    topFolds: 5, // Number of folds (used by parallel)
+    tubeWidth: 4,
+    spacing: 8
   });
 
   // Physical pattern parameters (in mm)
@@ -534,6 +641,60 @@ export default function TubeDropDisplayMVP() {
     amplitudeMm: 4.0,      // Wave amplitude in mm
     frequencyPerMm: 0.1,   // Wave frequency per mm
   });
+
+  // Generate 30 vertical tubes (15cm each) laid out horizontally, and map to one-tube schedule
+  const generateThirtyVerticalTubes = () => {
+    // Geometry params
+    const tubeCount = 30;
+    const tubeLengthCm = 15; // 150mm
+    const gapCm = 10; // 100mm logical gap between tubes in schedule
+
+    // Compute total length (cm) for Direct Schedule Editor
+    const totalLengthCm = tubeCount * tubeLengthCm + (tubeCount - 1) * gapCm;
+
+    // Build manual segments: each tube as one segment (default density level = 5)
+    const newSegments = [];
+    let cursor = 0; // in cm
+    for (let i = 0; i < tubeCount; i++) {
+      const startCm = cursor;
+      const endCm = cursor + tubeLengthCm;
+      newSegments.push({ startCm, endCm, densityLevel: 5 });
+      cursor = endCm;
+      if (i < tubeCount - 1) {
+        // Insert gap logically by advancing cursor (no segment for gap)
+        cursor += gapCm;
+      }
+    }
+
+    // Apply to manual editor state
+    setUseManualSchedule(true);
+    setManualTubeLengthCm(totalLengthCm);
+    setManualSegments(newSegments);
+    setManualSelectedIdx(-1);
+
+    // Also create path points for visual reference in Path canvas
+    // Render as a centered square region on canvas: both width and height are equal
+    const squareSizePx = Math.min(canvasW, canvasH) * 0.8;
+    const leftPx = (canvasW - squareSizePx) / 2;
+    const rightPx = leftPx + squareSizePx;
+    const topPx = (canvasH - squareSizePx) / 2;
+    const bottomPx = topPx + squareSizePx;
+
+    const horizontalStep = tubeCount > 1 ? (rightPx - leftPx) / (tubeCount - 1) : 0;
+
+    const newPoints = [];
+    for (let i = 0; i < tubeCount; i++) {
+      const x = leftPx + i * horizontalStep;
+      const top = { x, y: topPx };
+      const bottom = { x, y: bottomPx };
+      // Alternate direction per tube to visualize zigzag flatten order
+      if (i % 2 === 0) newPoints.push(top, bottom);
+      else newPoints.push(bottom, top);
+    }
+    setPoints(newPoints);
+    setViewMode('path');
+    setPatternMode(true);
+  };
 
   // Physical unit settings (Illustrator-like) - moved up to avoid initialization order issues
   const [physicalUnits, setPhysicalUnits] = useState({
@@ -555,6 +716,173 @@ export default function TubeDropDisplayMVP() {
   const [sampleStepPx, setSampleStepPx] = useState(2);
   const [threshold, setThreshold] = useState(0.5); // for dithering/2bit
   const [tubeVisualizationScale, setTubeVisualizationScale] = useState(1); // scale for tube visualization
+
+  // ----- ESP32 connection (WebSocket) -----
+  const [espIp, setEspIp] = useState("");
+  const [ws, setWs] = useState(null);
+  const [wsStatus, setWsStatus] = useState("disconnected"); // disconnected | connecting | connected
+  const [wsLogs, setWsLogs] = useState([]);
+
+  // Imported pattern (JSON) state
+  const fileInputRef = useRef(null);
+  const [importedSteps, setImportedSteps] = useState(null); // Array<{ ch0, ch1, duration }>
+  const [importedMeta, setImportedMeta] = useState(null); // { name, totalSteps, note? }
+
+  // Toast (popup) state
+  const [toast, setToast] = useState({ visible: false, message: "", type: "info" });
+  const triggerToast = (message, type = "info") => {
+    setToast({ visible: true, message, type });
+    setTimeout(() => setToast((t) => ({ ...t, visible: false })), 2500);
+  };
+
+  const appendLog = (msg) => {
+    setWsLogs((logs) => {
+      const next = [...logs, { t: new Date().toLocaleTimeString(), msg }];
+      return next.slice(-200);
+    });
+  };
+
+  const connectWs = () => {
+    if (!espIp) {
+      appendLog("Enter ESP32 IP first");
+      return;
+    }
+    if (wsStatus === "connecting" || wsStatus === "connected") return;
+    try {
+      setWsStatus("connecting");
+      appendLog(`Connecting to ws://${espIp}:81 ...`);
+      const socket = new WebSocket(`ws://${espIp}:81`);
+      socket.onopen = () => {
+        setWs(socket);
+        setWsStatus("connected");
+        appendLog(`WS connected to ${espIp}:81`);
+        triggerToast("Connected to device", "success");
+      };
+      socket.onmessage = (ev) => {
+        try {
+          const data = JSON.parse(ev.data);
+          if (data.type === "status") {
+            appendLog(`STATUS active=${data.patternActive} step=${data.currentStep}/${data.totalSteps}`);
+          } else if (data.type === "log") {
+            appendLog(data.msg);
+          } else {
+            appendLog(`RX: ${ev.data}`);
+          }
+        } catch (e) {
+          appendLog(`RX(raw): ${ev.data}`);
+        }
+      };
+      socket.onerror = (e) => {
+        appendLog("WS error");
+        triggerToast("Connection error", "error");
+      };
+      socket.onclose = () => {
+        setWs(null);
+        const wasConnecting = wsStatus === "connecting";
+        setWsStatus("disconnected");
+        appendLog("WS closed");
+        triggerToast(wasConnecting ? "Connection failed" : "Disconnected", wasConnecting ? "error" : "warning");
+      };
+    } catch (e) {
+      setWsStatus("disconnected");
+      appendLog(`WS connect failed: ${e?.message || e}`);
+      triggerToast("Connection failed", "error");
+    }
+  };
+
+  const disconnectWs = () => {
+    try { ws?.close(); } catch (_) {}
+    setWs(null);
+    setWsStatus("disconnected");
+    triggerToast("Disconnected", "warning");
+  };
+
+  const sendWs = (obj) => {
+    if (!ws || ws.readyState !== 1) {
+      appendLog("WS not connected");
+      return false;
+    }
+    const s = JSON.stringify(obj);
+    ws.send(s);
+    appendLog(`TX: ${s}`);
+    return true;
+  };
+
+  const sendStart = () => sendWs({ type: "control", cmd: "start" });
+  const sendStop = () => sendWs({ type: "control", cmd: "stop" });
+  const sendClear = () => sendWs({ type: "buffer", cmd: "clear" });
+
+  const sendPatternAndStart = async () => {
+    appendLog("Starting pattern execution sequence...");
+
+    // 1. Clear buffer
+    if (!sendClear()) return;
+    await new Promise(resolve => setTimeout(resolve, 100)); // Wait 100ms
+
+    // 2. Send pattern
+    if (!sendPattern()) return;
+    await new Promise(resolve => setTimeout(resolve, 200)); // Wait 200ms
+
+    // 3. Start execution
+    if (sendStart()) {
+      appendLog("Pattern execution started!");
+    }
+  };
+  const sendPattern = () => {
+    if (!useManualSchedule || manualSegments.length === 0) {
+      // Fallback to demo pattern if no manual segments
+      const demo = [
+        { ch0: 80, ch1: 70, duration: 1500 },
+        { ch0: 73, ch1: 70, duration: 2000 },
+      ];
+      return sendWs({ type: "pattern", steps: demo });
+    }
+
+    // Convert manual segments to EHD steps
+    const steps = segmentsToEHDSteps(manualSegments, calibrationParams.feedSpeed, 50, calibrationParams);
+    if (steps.length === 0) {
+      appendLog("No valid segments to send");
+      return false;
+    }
+
+    appendLog(`Sending ${steps.length} steps from ${manualSegments.length} segments`);
+    return sendWs({ type: "pattern", steps });
+  };
+
+  // Send imported pattern steps to device
+  const sendImportedPattern = () => {
+    if (!importedSteps || importedSteps.length === 0) {
+      appendLog("No imported steps to send");
+      triggerToast("インポートされたパターンがありません", "warning");
+      return false;
+    }
+    appendLog(`Sending imported ${importedSteps.length} steps`);
+    return sendWs({ type: "pattern", steps: importedSteps });
+  };
+
+  // Manual schedule editor states
+  const [useManualSchedule, setUseManualSchedule] = useState(true);
+  const [manualTubeLengthCm, setManualTubeLengthCm] = useState(10); // cm単位
+  const [manualEditorZoom, setManualEditorZoom] = useState(1); // 1x .. 5x
+  const [manualSegments, setManualSegments] = useState([]); // { startCm, endCm, densityLevel }
+  const [manualSelectedIdx, setManualSelectedIdx] = useState(-1);
+  const [manualDraggingIdx, setManualDraggingIdx] = useState(-1);
+  const [manualDraggingHandle, setManualDraggingHandle] = useState(null); // 'start' | 'end' | null
+  const [snapToGrid, setSnapToGrid] = useState(true); // 1cm刻みスナップ
+  const [isEditingNumeric, setIsEditingNumeric] = useState(false); // 数値入力中フラグ
+
+  // Calibration states
+  const [showCalibration, setShowCalibration] = useState(false);
+  const [calibrationParams, setCalibrationParams] = useState({
+    denseCh0: DENSE_PARAMS.ch0,
+    denseDuration: DENSE_PARAMS.duration_base,
+    denseResistance: DENSE_PARAMS.resistance_factor,
+    sparseCh0: SPARSE_PARAMS.ch0,
+    sparseDuration: SPARSE_PARAMS.duration_base,
+    sparseResistance: SPARSE_PARAMS.resistance_factor,
+    ch1: DENSE_PARAMS.ch1,
+    feedSpeed: feedSpeed
+  });
 
   // Update canvas size when physical units change
   useEffect(() => {
@@ -653,6 +981,345 @@ export default function TubeDropDisplayMVP() {
     });
   }, [useText, textInput, textSize, imgObj, canvasW, canvasH, contentPosition, contentBrightness, contentContrast, contentObjects]);
 
+  // ----------------- Manual schedule -> dropSchedule integration -----------------
+  useEffect(() => {
+    if (!useManualSchedule) return;
+    const sorted = [...manualSegments].sort((a, b) => a.startCm - b.startCm);
+    const mapped = sorted.map((seg) => {
+      const startMm = clamp(seg.startCm * 10, 0, Math.max(0, manualTubeLengthCm * 10));
+      const endMm = clamp(seg.endCm * 10, startMm, Math.max(0, manualTubeLengthCm * 10));
+      const s_mm = (startMm + endMm) / 2; // 区間の中央
+      const s_px = s_mm / mmPerPixel;
+      const width_mm = endMm - startMm; // 区間の長さ
+      const amplitude = clamp(seg.densityLevel / 10, 0, 1); // 濃度レベル1-10を0-1に正規化
+      const t_ms = (s_mm / feedSpeed) * 1000;
+      return { s_px, s_mm, t_ms, width_mm, amplitude };
+    });
+    setDropSchedule(mapped);
+  }, [useManualSchedule, manualSegments, manualTubeLengthCm, mmPerPixel, feedSpeed]);
+
+  // ----------------- Manual schedule editor drawing -----------------
+  useEffect(() => {
+    const canvas = manualEditorRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    const dpr = window.devicePixelRatio || 1;
+
+    const pxPerCm = 40 * manualEditorZoom; // 1cm = 40px (ズーム適用)
+    const axisWidth = Math.max(800, Math.ceil(manualTubeLengthCm * pxPerCm));
+    const axisHeight = 120; // 高さを増やしてチューブらしく
+
+    canvas.width = Math.floor(axisWidth * dpr);
+    canvas.height = Math.floor(axisHeight * dpr);
+    canvas.style.width = axisWidth + 'px';
+    canvas.style.height = axisHeight + 'px';
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    // 背景
+    ctx.fillStyle = '#0a0a0a';
+    ctx.fillRect(0, 0, axisWidth, axisHeight);
+
+    // 1cmグリッド線
+    ctx.strokeStyle = '#333333';
+    ctx.lineWidth = 1;
+    ctx.globalAlpha = 0.3;
+    for (let cm = 0; cm <= manualTubeLengthCm; cm++) {
+      const x = Math.round(cm * pxPerCm);
+    ctx.beginPath();
+      ctx.moveTo(x, 0);
+      ctx.lineTo(x, axisHeight);
+    ctx.stroke();
+    }
+
+    // チューブ本体（太い線）
+    const tubeY = axisHeight / 2;
+    const tubeRadius = 8;
+    ctx.strokeStyle = '#ffffff';
+    ctx.globalAlpha = 0.8;
+    ctx.lineWidth = tubeRadius * 2;
+    ctx.beginPath();
+    ctx.moveTo(0, tubeY);
+    ctx.lineTo(axisWidth, tubeY);
+    ctx.stroke();
+
+    // チューブの内側（薄い線）
+    ctx.strokeStyle = '#000000';
+    ctx.globalAlpha = 0.6;
+    ctx.lineWidth = tubeRadius * 2 - 4;
+    ctx.beginPath();
+    ctx.moveTo(0, tubeY);
+    ctx.lineTo(axisWidth, tubeY);
+    ctx.stroke();
+
+    // 1cm刻みの目盛りとラベル
+    ctx.fillStyle = '#ffffff';
+    ctx.font = '10px monospace';
+    for (let cm = 0; cm <= manualTubeLengthCm; cm++) {
+      const x = Math.round(cm * pxPerCm);
+      ctx.globalAlpha = 0.6;
+      ctx.beginPath();
+      ctx.moveTo(x, tubeY - 20);
+      ctx.lineTo(x, tubeY + 20);
+      ctx.stroke();
+      ctx.globalAlpha = 0.9;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'top';
+      ctx.fillText(`${cm}cm`, x, tubeY + 25);
+    }
+
+    // 区間の描画（チューブ上に重ねる）
+    manualSegments.forEach((seg, i) => {
+      const startX = clamp(seg.startCm, 0, manualTubeLengthCm) * pxPerCm;
+      const endX = clamp(seg.endCm, seg.startCm, manualTubeLengthCm) * pxPerCm;
+      const width = endX - startX;
+
+      const isSel = i === manualSelectedIdx;
+
+      // 濃度レベルに応じた色（1=薄い青、10=濃い青）
+      const densityRatio = (seg.densityLevel - 1) / 9; // 0-1に正規化
+      const r = Math.round(lerp(100, 20, densityRatio));
+      const g = Math.round(lerp(150, 50, densityRatio));
+      const b = Math.round(lerp(255, 100, densityRatio));
+
+      // 区間バー（チューブ上に重ねる）
+      const barHeight = tubeRadius * 2;
+      ctx.fillStyle = `rgba(${r}, ${g}, ${b}, ${isSel ? 0.9 : 0.7})`;
+      ctx.fillRect(startX, tubeY - tubeRadius, width, barHeight);
+
+      // 境界線
+      ctx.strokeStyle = isSel ? '#ffffff' : 'rgba(255,255,255,0.6)';
+      ctx.lineWidth = isSel ? 3 : 2;
+      ctx.strokeRect(startX, tubeY - tubeRadius, width, barHeight);
+
+      // 濃度レベル表示
+      ctx.fillStyle = '#ffffff';
+      ctx.font = 'bold 9px monospace';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(`L${seg.densityLevel}`, startX + width/2, tubeY);
+
+      // 選択時はハンドルを表示
+      if (isSel) {
+        // 開始ハンドル
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(startX - 3, tubeY - tubeRadius - 5, 6, 10);
+        ctx.strokeStyle = '#000000';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(startX - 3, tubeY - tubeRadius - 5, 6, 10);
+
+        // 終了ハンドル
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(endX - 3, tubeY - tubeRadius - 5, 6, 10);
+        ctx.strokeStyle = '#000000';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(endX - 3, tubeY - tubeRadius - 5, 6, 10);
+      }
+    });
+  }, [manualSegments, manualSelectedIdx, manualTubeLengthCm, manualEditorZoom]);
+
+  // Manual editor pointer handlers
+  const hitTestManualSegment = (mx, my) => {
+    const canvas = manualEditorRef.current;
+    if (!canvas) return { segmentIdx: -1, handle: null };
+    const rect = canvas.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    const pxPerCm = 40 * manualEditorZoom;
+    const x = (mx - rect.left) * ((canvas.width / dpr) / rect.width);
+    const y = (my - rect.top) * ((canvas.height / dpr) / rect.height);
+    const tubeY = 120 / 2; // axisHeight / 2
+    const tubeRadius = 8;
+    const handleSize = 6;
+    const tolerance = 10; // クリック許容範囲
+
+    for (let i = manualSegments.length - 1; i >= 0; i--) {
+      const seg = manualSegments[i];
+      const startX = clamp(seg.startCm, 0, manualTubeLengthCm) * pxPerCm;
+      const endX = clamp(seg.endCm, seg.startCm, manualTubeLengthCm) * pxPerCm;
+
+      // ハンドルのヒットテスト（選択されている区間のみ）
+      if (i === manualSelectedIdx) {
+        // 開始ハンドル
+        if (x >= startX - handleSize/2 - tolerance && x <= startX + handleSize/2 + tolerance &&
+            y >= tubeY - tubeRadius - 5 - tolerance && y <= tubeY - tubeRadius - 5 + 10 + tolerance) {
+          return { segmentIdx: i, handle: 'start' };
+        }
+        // 終了ハンドル
+        if (x >= endX - handleSize/2 - tolerance && x <= endX + handleSize/2 + tolerance &&
+            y >= tubeY - tubeRadius - 5 - tolerance && y <= tubeY - tubeRadius - 5 + 10 + tolerance) {
+          return { segmentIdx: i, handle: 'end' };
+        }
+      }
+
+      // 区間内のクリックを検出
+      if (x >= startX - tolerance && x <= endX + tolerance &&
+          y >= tubeY - tubeRadius - tolerance && y <= tubeY + tubeRadius + tolerance) {
+        return { segmentIdx: i, handle: null };
+      }
+    }
+    return { segmentIdx: -1, handle: null };
+  };
+
+  const onManualPointerDown = (e) => {
+    const hit = hitTestManualSegment(e.clientX, e.clientY);
+
+    if (hit.segmentIdx >= 0) {
+      setManualSelectedIdx(hit.segmentIdx);
+
+      if (hit.handle) {
+        // ハンドルをドラッグ開始
+        setManualDraggingIdx(hit.segmentIdx);
+        setManualDraggingHandle(hit.handle);
+      } else {
+        // 区間全体をドラッグ開始
+        setManualDraggingIdx(hit.segmentIdx);
+        setManualDraggingHandle(null);
+      }
+      return;
+    }
+
+    // 新しい区間を追加
+    const canvas = manualEditorRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    const pxPerCm = 40 * manualEditorZoom;
+    const x = (e.clientX - rect.left) * ((canvas.width / dpr) / rect.width);
+    let preferredStart = clamp(x / pxPerCm, 0, manualTubeLengthCm);
+    const preferredLength = 1; // デフォルト1cm長
+
+    // スナップ機能適用
+    if (snapToGrid) {
+      preferredStart = Math.round(preferredStart);
+    }
+
+    // 重複しない位置を見つける
+    const availablePosition = findNextAvailablePosition(
+      manualSegments,
+      preferredStart,
+      preferredLength,
+      manualTubeLengthCm
+    );
+
+    if (availablePosition) {
+      const newSegment = {
+        startCm: availablePosition.startCm,
+        endCm: availablePosition.endCm,
+        densityLevel: 5
+      };
+      setManualSegments((arr) => [...arr, newSegment]);
+      setManualSelectedIdx(manualSegments.length);
+      setManualDraggingIdx(manualSegments.length);
+      setManualDraggingHandle(null);
+    }
+  };
+
+  const onManualPointerMove = (e) => {
+    if (manualDraggingIdx < 0) return;
+    const canvas = manualEditorRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    const pxPerCm = 40 * manualEditorZoom;
+    const x = (e.clientX - rect.left) * ((canvas.width / dpr) / rect.width);
+    let newPosition = clamp(x / pxPerCm, 0, manualTubeLengthCm);
+
+    // スナップ機能適用
+    if (snapToGrid) {
+      newPosition = Math.round(newPosition);
+    }
+
+    const currentSegment = manualSegments[manualDraggingIdx];
+    const minGap = snapToGrid ? 1 : 0.1;
+
+    setManualSegments((arr) => arr.map((seg, i) => {
+      if (i !== manualDraggingIdx) return seg;
+
+      if (manualDraggingHandle === 'start') {
+        // 開始ハンドルをドラッグ
+        const newStartCm = Math.min(newPosition, seg.endCm - minGap);
+        const newSegment = { ...seg, startCm: newStartCm };
+
+        // 他の区間と重複しないかチェック
+        const hasOverlap = arr.some((otherSeg, otherIdx) =>
+          otherIdx !== i && segmentsOverlap(newSegment, otherSeg)
+        );
+
+        if (!hasOverlap) {
+          return newSegment;
+        }
+        return seg; // 重複する場合は変更しない
+      } else if (manualDraggingHandle === 'end') {
+        // 終了ハンドルをドラッグ
+        const maxEnd = manualTubeLengthCm;
+        const newEndCm = Math.min(
+          Math.max(newPosition, seg.startCm + minGap),
+          maxEnd
+        );
+        const newSegment = { ...seg, endCm: newEndCm };
+
+        // 他の区間と重複しないかチェック
+        const hasOverlap = arr.some((otherSeg, otherIdx) =>
+          otherIdx !== i && segmentsOverlap(newSegment, otherSeg)
+        );
+
+        if (!hasOverlap) {
+          return newSegment;
+        }
+        return seg; // 重複する場合は変更しない
+      } else {
+        // 区間全体をドラッグ
+        const lengthCm = seg.endCm - seg.startCm;
+        const newStartCm = Math.min(newPosition, manualTubeLengthCm - lengthCm);
+        const newEndCm = newStartCm + lengthCm;
+        const newSegment = { ...seg, startCm: newStartCm, endCm: newEndCm };
+
+        // 他の区間と重複しないかチェック
+        const hasOverlap = arr.some((otherSeg, otherIdx) =>
+          otherIdx !== i && segmentsOverlap(newSegment, otherSeg)
+        );
+
+        if (!hasOverlap) {
+          return newSegment;
+        }
+        return seg; // 重複する場合は変更しない
+      }
+    }));
+  };
+
+  const onManualPointerUp = () => {
+    setManualDraggingIdx(-1);
+    setManualDraggingHandle(null);
+  };
+
+  const onManualContextMenu = (e) => {
+    e.preventDefault();
+    const hit = hitTestManualSegment(e.clientX, e.clientY);
+    if (hit.segmentIdx >= 0) {
+      setManualSegments((arr) => arr.filter((_, i) => i !== hit.segmentIdx));
+      setManualSelectedIdx(-1);
+      setManualDraggingIdx(-1);
+      setManualDraggingHandle(null);
+    }
+  };
+
+  useEffect(() => {
+    const onKey = (e) => {
+      // 数値入力フィールド内または数値入力中ではDeleteキーを無視
+      if (e.target.type === 'number' || isEditingNumeric) {
+        return;
+      }
+
+      if (manualSelectedIdx >= 0 && (e.key === 'Delete' || e.key === 'Backspace')) {
+        setManualSegments((arr) => arr.filter((_, i) => i !== manualSelectedIdx));
+        setManualSelectedIdx(-1);
+        setManualDraggingIdx(-1);
+        setManualDraggingHandle(null);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [manualSelectedIdx, isEditingNumeric]);
+
   // ----------------- Path sampling & signal synthesis -----------------
   const recompute = () => {
     console.log('recompute called:', {
@@ -666,7 +1333,8 @@ export default function TubeDropDisplayMVP() {
       console.log('recompute: clearing signals - no imgData or points');
       setFSignal([]);
       setGSignal([]);
-      setDropSchedule([]);
+      // 手動スケジュール使用時は dropSchedule をクリアしない
+      if (!useManualSchedule) setDropSchedule([]);
       setResampledPath([]);
       return;
     }
@@ -734,7 +1402,8 @@ export default function TubeDropDisplayMVP() {
 
     setFSignal(f);
     setGSignal(g);
-    setDropSchedule(drops);
+    // 手動スケジュール使用時は canvas 由来のドロップを上書きしない
+    if (!useManualSchedule) setDropSchedule(drops);
 
     console.log('recompute completed:', {
       fSignalLength: f.length,
@@ -1394,14 +2063,13 @@ export default function TubeDropDisplayMVP() {
           setPatternStartPoint({ x, y });
         } else if (!patternEndPoint) {
           setPatternEndPoint({ x, y });
-          // Generate pattern points and add to manual points array
-          const patternPoints = generatePatternPoints(selectedPatternType, { x, y }, patternStartPoint, patternParams);
-          setPoints(prev => [...prev, ...patternPoints]);
+          // Generate parallel points and REPLACE manual points (unify to manual)
+          const patternPoints = generatePatternPoints('parallel', patternStartPoint, { x, y }, patternParams);
+          setPoints(patternPoints);
         } else {
           // Reset and start over
           setPatternStartPoint({ x, y });
           setPatternEndPoint(null);
-          // Clear pattern points from manual points array
           setPoints([]);
         }
       } else {
@@ -1791,6 +2459,87 @@ export default function TubeDropDisplayMVP() {
     URL.revokeObjectURL(url);
   };
 
+  // -------------- Import JSON (Manual Pattern) --------------
+  const validateStep = (s) => {
+    if (!s) return false;
+    const ch0Ok = Number.isFinite(s.ch0) && s.ch0 >= 0 && s.ch0 <= 100;
+    const ch1Ok = Number.isFinite(s.ch1) && s.ch1 >= 0 && s.ch1 <= 100;
+    const durOk = Number.isFinite(s.duration) && s.duration >= 1;
+    return ch0Ok && ch1Ok && durOk;
+  };
+
+  const buildStepsFromSegments = (json) => {
+    try {
+      const segs = Array.isArray(json?.segments) ? json.segments : [];
+      if (segs.length === 0) return [];
+      const calib = json?.calibration || calibrationParams;
+      const feed = Number.isFinite(calib?.feedSpeed) ? calib.feedSpeed : calibrationParams.feedSpeed;
+      const steps = segmentsToEHDSteps(segs, feed, 100, {
+        denseCh0: calib?.denseCh0 ?? calibrationParams.denseCh0,
+        denseDuration: calib?.denseDuration ?? calibrationParams.denseDuration,
+        denseResistance: calib?.denseResistance ?? calibrationParams.denseResistance,
+        sparseCh0: calib?.sparseCh0 ?? calibrationParams.sparseCh0,
+        sparseDuration: calib?.sparseDuration ?? calibrationParams.sparseDuration,
+        sparseResistance: calib?.sparseResistance ?? calibrationParams.sparseResistance,
+        ch1: calib?.ch1 ?? calibrationParams.ch1,
+        feedSpeed: feed,
+      });
+      return steps;
+    } catch (_) {
+      return [];
+    }
+  };
+
+  const extractStepsFromJson = (json) => {
+    const direct = Array.isArray(json?.steps) ? json.steps : null;
+    const generated = Array.isArray(json?.generated?.steps) ? json.generated.steps : null;
+    let steps = direct || generated || [];
+    if (!steps.length) {
+      steps = buildStepsFromSegments(json);
+    }
+    // Normalize and validate
+    const normalized = steps.map((s) => ({
+      ch0: Math.round(clamp(s.ch0 ?? 0, 0, 100)),
+      ch1: Math.round(clamp(s.ch1 ?? calibrationParams.ch1, 0, 100)),
+      duration: Math.round(Math.max(1, s.duration ?? 0)),
+    })).filter(validateStep);
+    return normalized;
+  };
+
+  const handleImportJsonFile = (file) => {
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const text = String(reader.result || "");
+        const json = JSON.parse(text);
+        const steps = extractStepsFromJson(json);
+        if (!steps || steps.length === 0) {
+          triggerToast("有効なステップが見つかりませんでした", "error");
+          appendLog("Import failed: no valid steps");
+          setImportedSteps(null);
+          setImportedMeta(null);
+          return;
+        }
+        setImportedSteps(steps);
+        setImportedMeta({
+          name: file.name,
+          totalSteps: steps.length,
+          note: json?.meta?.note || undefined,
+        });
+        appendLog(`Imported ${steps.length} steps from ${file.name}`);
+        triggerToast("JSONを読み込みました", "success");
+      } catch (e) {
+        triggerToast("JSONの読み込みに失敗しました", "error");
+        appendLog(`Import error: ${e?.message || e}`);
+      }
+    };
+    reader.onerror = () => {
+      triggerToast("ファイル読み込みエラー", "error");
+    };
+    reader.readAsText(file);
+  };
+
   // ----------------- Handlers -----------------
   const onImageLoad = (file) => {
     const img = new Image();
@@ -1850,13 +2599,13 @@ export default function TubeDropDisplayMVP() {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [viewMode, selectedObjectId, hoverIdx, points.length, patternMode, editingTextId, contentObjects]);
 
-  // Regenerate pattern points when parameters change
+  // Regenerate pattern points when parameters change (parallel only)
   useEffect(() => {
     if (patternMode && patternStartPoint && patternEndPoint) {
-      const patternPoints = generatePatternPoints(selectedPatternType, patternStartPoint, patternEndPoint, patternParams);
+      const patternPoints = generatePatternPoints('parallel', patternStartPoint, patternEndPoint, patternParams);
       setPoints(patternPoints);
     }
-  }, [patternMode, selectedPatternType, patternStartPoint, patternEndPoint, patternParams]);
+  }, [patternMode, patternStartPoint, patternEndPoint, patternParams]);
 
   // Auto recompute when key params change
   useEffect(() => {
@@ -1903,53 +2652,37 @@ export default function TubeDropDisplayMVP() {
          <header className="flex flex-col lg:flex-row lg:items-end lg:justify-between gap-6">
            <div className="space-y-2">
              <h1 className="text-4xl lg:text-5xl font-bold tracking-tight bg-gradient-to-r from-white to-white/70 bg-clip-text text-transparent">
-               TubeDrop Display
+               FiberDrops
              </h1>
              <p className="text-white/60 text-lg">Draw 2D with a single tube → Synthesize & visualize 1D droplet schedule</p>
            </div>
            <div className="flex items-center gap-6">
-             <div className="flex items-center gap-3">
-               <span className="text-white/60 text-sm font-medium">Canvas Size:</span>
+             {/* ESP32 Connection Panel */}
+             <div className="bg-black/40 border border-white/10 rounded-xl p-4 flex items-center gap-4">
                <div className="flex items-center gap-2">
+                 <span className="text-white/70 text-sm font-medium">ESP32 IP:</span>
                  <input
-                   type="number"
-                   className="input-field w-20 text-center"
-                   value={physicalUnits.canvasWidthMm}
-                   onChange={(e) => setPhysicalUnits(prev => ({
-                     ...prev,
-                     canvasWidthMm: clamp(parseFloat(e.target.value || "180"), 10, 1000)
-                   }))}
-                   title="Width (mm)"
+                   type="text"
+                   className="input-field w-32 text-center text-sm"
+                   placeholder="192.168.0.x"
+                   value={espIp}
+                   onChange={(e) => setEspIp(e.target.value.trim())}
                  />
-                 <span className="text-white/40">×</span>
-                 <input
-                   type="number"
-                   className="input-field w-20 text-center"
-                   value={physicalUnits.canvasHeightMm}
-                   onChange={(e) => setPhysicalUnits(prev => ({
-                     ...prev,
-                     canvasHeightMm: clamp(parseFloat(e.target.value || "120"), 10, 1000)
-                   }))}
-                   title="Height (mm)"
-                 />
-                 <span className="text-white/40 text-xs">mm</span>
                </div>
-             </div>
-             <div className="flex items-center gap-3">
-               <span className="text-white/60 text-sm font-medium">Tube Diameter:</span>
-               <div className="flex items-center gap-2">
-                 <input
-                   type="number"
-                   step="0.1"
-                   className="input-field w-16 text-center"
-                   value={physicalUnits.tubeDiameterMm}
-                   onChange={(e) => setPhysicalUnits(prev => ({
-                     ...prev,
-                     tubeDiameterMm: clamp(parseFloat(e.target.value || "0.5"), 0.1, 10)
-                   }))}
-                   title="Tube Diameter (mm)"
-                 />
-                 <span className="text-white/40 text-xs">mm</span>
+               {wsStatus !== "connected" ? (
+                 <button
+                   onClick={connectWs}
+                   disabled={wsStatus === "connecting"}
+                   className={`px-4 py-2 rounded-lg text-sm font-medium border transition-colors ${wsStatus === "connecting" ? 'bg-white/10 text-white/50 border-white/10 cursor-not-allowed' : 'bg-white/20 text-white border-white/30 hover:bg-white/30'}`}
+                 >{wsStatus === "connecting" ? 'Connecting…' : 'Connect'}</button>
+               ) : (
+                 <button
+                   onClick={disconnectWs}
+                   className="px-4 py-2 rounded-lg text-sm font-medium bg-white/10 text-white/80 border border-white/20 hover:bg-white/20 transition-colors"
+                 >Disconnect</button>
+               )}
+               <div className={`text-xs px-3 py-1 rounded-full font-medium ${wsStatus === 'connected' ? 'bg-emerald-600/30 text-emerald-200' : wsStatus === 'connecting' ? 'bg-yellow-600/30 text-yellow-200' : 'bg-white/10 text-white/60'}`}>
+                 {wsStatus === 'connected' ? `Connected: ${espIp}` : wsStatus === 'connecting' ? 'Connecting...' : 'No device'}
                </div>
              </div>
            </div>
@@ -2322,27 +3055,20 @@ export default function TubeDropDisplayMVP() {
                 {patternMode && (
                   <div>
                     <label className="block text-sm font-medium text-white/80 mb-3">Pattern Type</label>
-                    <div className="grid grid-cols-2 gap-2">
-                      {[
-                        { id: 'zigzag', label: 'Zigzag', icon: '⚡' },
-                        { id: 'parallel', label: 'Parallel', icon: '||' },
-                        { id: 'wave', label: 'Wave', icon: '~' }
-                      ].map(pattern => (
+                    <div className="grid grid-cols-1 gap-2">
                         <button
-                          key={pattern.id}
-                          onClick={() => setSelectedPatternType(pattern.id)}
+                        onClick={() => setSelectedPatternType('parallel')}
                           className={`px-3 py-2 rounded-lg text-sm font-medium transition-all duration-200 ${
-                            selectedPatternType === pattern.id
+                          selectedPatternType === 'parallel'
                               ? 'bg-white/20 text-white border border-white/30'
                               : 'bg-black/40 text-white/60 border border-white/10 hover:bg-black/60 hover:text-white/80'
                           }`}
                         >
                           <div className="flex items-center gap-2">
-                            <span>{pattern.icon}</span>
-                            <span>{pattern.label}</span>
+                          <span>||</span>
+                          <span>Parallel</span>
                           </div>
                         </button>
-                      ))}
                     </div>
                   </div>
                 )}
@@ -2363,41 +3089,7 @@ export default function TubeDropDisplayMVP() {
                           {selectedPatternType === 'wave' && <p>5. Wave: 波状パターン</p>}
                         </div>
 
-                        {/* Fold Counts (for zigzag pattern) */}
-                        {selectedPatternType === 'zigzag' && (
-                          <div className="grid grid-cols-2 gap-3">
-                              <div>
-                                <label className="block text-xs font-medium text-white/70 mb-1">
-                                 Top Folds: {patternParams.topFolds}
-                                </label>
-                              <input
-                                type="range"
-                                min={1}
-                                max={20}
-                                step={1}
-                                value={patternParams.topFolds}
-                                onChange={(e) => setPatternParams(prev => ({ ...prev, topFolds: parseInt(e.target.value) }))}
-                                className="w-full h-2 bg-black/40 rounded-lg appearance-none cursor-pointer slider"
-                              />
-                            </div>
-                              <div>
-                                <label className="block text-xs font-medium text-white/70 mb-1">
-                                 Bottom Folds: {patternParams.bottomFolds}
-                                </label>
-                              <input
-                                type="range"
-                                min={1}
-                                max={20}
-                                step={1}
-                                value={patternParams.bottomFolds}
-                                onChange={(e) => setPatternParams(prev => ({ ...prev, bottomFolds: parseInt(e.target.value) }))}
-                                className="w-full h-2 bg-black/40 rounded-lg appearance-none cursor-pointer slider"
-                              />
-                            </div>
-                          </div>
-                        )}
-
-                        {/* Fold Count (for parallel pattern) */}
+                        {/* Fold Count (for parallel pattern only) */}
                         {selectedPatternType === 'parallel' && (
                           <div>
                             <label className="block text-xs font-medium text-white/70 mb-1">
@@ -2412,6 +3104,25 @@ export default function TubeDropDisplayMVP() {
                               onChange={(e) => setPatternParams(prev => ({ ...prev, topFolds: parseInt(e.target.value) }))}
                               className="w-full h-2 bg-black/40 rounded-lg appearance-none cursor-pointer slider"
                             />
+                            <div className="mt-3 grid grid-cols-2 gap-2">
+                              <button
+                                onClick={() => {
+                                  // Build parallel path with fixed 15cm margins
+                                  if (!patternStartPoint || !patternEndPoint) return;
+                                  const pts = generateParallelWithMargins(patternStartPoint, patternEndPoint, patternParams, mmPerPixel, physicalUnits);
+                                  setPoints(pts);
+                                }}
+                                className="px-3 py-2 rounded bg-white/10 text-white/80 border border-white/20 hover:bg-white/20 text-xs"
+                              >
+                                Apply 15cm Margins
+                              </button>
+                              <button
+                                onClick={generateThirtyVerticalTubes}
+                                className="px-3 py-2 rounded bg-white/10 text-white/80 border border-white/20 hover:bg-white/20 text-xs"
+                              >
+                                Generate 30 Vertical Tubes
+                              </button>
+                            </div>
                           </div>
                         )}
 
@@ -2430,42 +3141,9 @@ export default function TubeDropDisplayMVP() {
                             className="w-full h-2 bg-black/40 rounded-lg appearance-none cursor-pointer slider"
                           />
                         </div>
-
-                        {/* Wave Pattern Parameters (Physical) */}
-                        {selectedPatternType === 'wave' && (
-                          <>
-                            <div>
-                              <label className="block text-xs font-medium text-white/70 mb-1">
-                               Amplitude: {physicalPatternParams.amplitudeMm.toFixed(1)}mm
-                              </label>
-                              <input
-                                type="range"
-                                min={0.5}
-                                max={20}
-                                step={0.1}
-                                value={physicalPatternParams.amplitudeMm}
-                                onChange={(e) => setPhysicalPatternParams(prev => ({ ...prev, amplitudeMm: parseFloat(e.target.value) }))}
-                                className="w-full h-2 bg-black/40 rounded-lg appearance-none cursor-pointer slider"
-                              />
+                        {/* Remove wave-specific params */}
                             </div>
-                            <div>
-                              <label className="block text-xs font-medium text-white/70 mb-1">
-                               Frequency: {physicalPatternParams.frequencyPerMm.toFixed(3)}/mm
-                              </label>
-                              <input
-                                type="range"
-                                min={0.01}
-                                max={1.0}
-                                step={0.01}
-                                value={physicalPatternParams.frequencyPerMm}
-                                onChange={(e) => setPhysicalPatternParams(prev => ({ ...prev, frequencyPerMm: parseFloat(e.target.value) }))}
-                                className="w-full h-2 bg-black/40 rounded-lg appearance-none cursor-pointer slider"
-                              />
                             </div>
-                          </>
-                        )}
-                    </div>
-                  </div>
                 )}
               </div>
             )}
@@ -2473,6 +3151,11 @@ export default function TubeDropDisplayMVP() {
           </section>
 
           </div>
+          {importedSteps && importedSteps.length > 0 && (
+            <div className="text-xs text-white/60 mb-2">
+              Imported: {importedMeta?.name || 'unnamed'} • Steps: {importedSteps.length}{importedMeta?.note ? ` • ${importedMeta.note}` : ''}
+            </div>
+          )}
 
           {/* Right Side - Canvas */}
           <div className="flex-1 space-y-6">
@@ -2524,14 +3207,64 @@ export default function TubeDropDisplayMVP() {
               </div>
             </div>
             <div className="flex items-center gap-4">
-              <div className="metric-display">
-                Points: {points.length}
-              </div>
-              <div className="metric-display">
-                Canvas: {physicalUnits.canvasWidthMm.toFixed(0)}×{physicalUnits.canvasHeightMm.toFixed(0)}mm
-              </div>
-              <div className="metric-display">
-                Tube: Ø{physicalUnits.tubeDiameterMm.toFixed(1)}mm
+              {/* Quick WS Actions */}
+              <div className="flex items-center gap-2">
+                {/* Hidden file input for import */}
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept="application/json"
+                  style={{ display: 'none' }}
+                  onChange={(e) => {
+                    const file = e.target.files && e.target.files[0];
+                    if (file) handleImportJsonFile(file);
+                    if (e.target) e.target.value = '';
+                  }}
+                />
+                <button
+                  onClick={() => fileInputRef.current?.click()}
+                  className="px-4 py-2 rounded-lg bg-white/10 text-white/80 border border-white/20 hover:bg-white/20 text-sm font-medium transition-colors"
+                  title="Import pattern JSON"
+                >
+                  Import JSON
+                </button>
+                <button
+                  onClick={sendImportedPattern}
+                  disabled={!importedSteps || importedSteps.length === 0}
+                  className={`px-4 py-2 rounded-lg text-sm font-medium border transition-colors ${(!importedSteps || importedSteps.length === 0) ? 'bg-white/10 text-white/40 border-white/10 cursor-not-allowed' : 'bg-white/20 text-white border-white/30 hover:bg-white/30'}`}
+                  title="Send imported steps to device"
+                >
+                  Send Imported
+                </button>
+                <button
+                  onClick={sendClear}
+                  className="px-4 py-2 rounded-lg bg-white/10 text-white/80 border border-white/20 hover:bg-white/20 text-sm font-medium transition-colors"
+                  title="Clear pattern buffer"
+                >
+                  Clear
+                </button>
+                <button
+                  onClick={sendPattern}
+                  className="px-4 py-2 rounded-lg bg-white/20 text-white border border-white/30 hover:bg-white/30 text-sm font-medium transition-colors"
+                  title="Send pattern to device"
+                >
+                  Send Pattern
+                </button>
+                {/* Execute button removed to simplify flow (Import/Send/Start) */}
+                <button
+                  onClick={sendStart}
+                  className="px-4 py-2 rounded-lg bg-emerald-600/40 text-emerald-100 border border-emerald-400/30 hover:bg-emerald-600/60 text-sm font-medium transition-colors"
+                  title="Start pattern execution"
+                >
+                  Start
+                </button>
+                <button
+                  onClick={sendStop}
+                  className="px-4 py-2 rounded-lg bg-rose-600/40 text-rose-100 border border-rose-400/30 hover:bg-rose-600/60 text-sm font-medium transition-colors"
+                  title="Stop pattern execution"
+                >
+                  Stop
+                </button>
               </div>
             </div>
           </div>
@@ -2611,6 +3344,412 @@ export default function TubeDropDisplayMVP() {
               />
             </div>
           </div>
+        </section>
+
+        {/* Direct Schedule Editor - Below Tube Visualization */}
+        <section className="canvas-container mt-6">
+          <div className="flex items-center justify-between mb-4">
+            <div className="flex items-center gap-3">
+              <div className="w-3 h-3 bg-white/60 rounded-full" />
+              <h3 className="text-lg font-semibold text-white/90">Direct Schedule Editor</h3>
+            </div>
+            <div className="flex items-center gap-6">
+              <label className="flex items-center gap-2 text-white/80 text-sm">
+                <input
+                  type="checkbox"
+                  className="accent-white"
+                  checked={useManualSchedule}
+                  onChange={(e) => setUseManualSchedule(e.target.checked)}
+                />
+                Use manual schedule
+              </label>
+              <div className="flex items-center gap-2">
+                <span className="text-white/60 text-sm">Length:</span>
+                <input
+                  type="number"
+                  className="input-field w-20 text-center"
+                  value={manualTubeLengthCm}
+                  min={1}
+                  max={1000}
+                  step={1}
+                  onChange={(e) => {
+                    const value = e.target.value;
+                    if (value === '') {
+                      // 空の場合は何もしない（ユーザーが入力中）
+                      return;
+                    }
+                    const numValue = parseFloat(value);
+                    if (!isNaN(numValue)) {
+                      setManualTubeLengthCm(clamp(numValue, 1, 1000));
+                    }
+                  }}
+                  onBlur={(e) => {
+                    // フォーカスが外れた時に空の場合はデフォルト値に戻す
+                    if (e.target.value === '') {
+                      setManualTubeLengthCm(10);
+                    }
+                  }}
+                  title="Tube length (cm)"
+                />
+                <span className="text-white/40 text-xs">cm</span>
+              </div>
+              <div className="flex items-center gap-2">
+                <span className="text-white/60 text-sm">Zoom:</span>
+                <input
+                  type="range"
+                  min={0.5}
+                  max={5}
+                  step={0.1}
+                  value={manualEditorZoom}
+                  onChange={(e) => setManualEditorZoom(parseFloat(e.target.value))}
+                  className="w-24 h-2 bg-white/20 rounded-lg appearance-none cursor-pointer"
+                />
+                <span className="text-white/80 text-sm w-10">{manualEditorZoom.toFixed(1)}x</span>
+              </div>
+              <button
+                onClick={() => setShowCalibration(!showCalibration)}
+                className="px-3 py-1 rounded bg-purple-600/40 text-purple-100 border border-purple-400/30 hover:bg-purple-600/60 text-xs"
+              >
+                {showCalibration ? 'Hide' : 'Show'} Calibration
+              </button>
+              <label className="flex items-center gap-2 text-white/80 text-sm">
+                <input
+                  type="checkbox"
+                  className="accent-white"
+                  checked={snapToGrid}
+                  onChange={(e) => setSnapToGrid(e.target.checked)}
+                />
+                Snap to 1cm
+              </label>
+            </div>
+          </div>
+          <p className="text-sm text-white/60 mb-3">Click to add segment • Drag segment to move • Drag handles to resize • Right-click/Delete to remove • Density level 1-10</p>
+
+          {/* Calibration Panel */}
+          {showCalibration && (
+            <div className="mb-4 p-4 bg-purple-900/20 rounded-lg border border-purple-400/20">
+              <h4 className="text-purple-100 font-medium mb-3">EHD Calibration Parameters</h4>
+              <div className="grid grid-cols-2 gap-6">
+                <div>
+                  <h5 className="text-purple-200 text-sm font-medium mb-2">Dense (Level 10)</h5>
+                  <div className="space-y-2">
+                    <div>
+                      <label className="block text-purple-300 text-xs mb-1">CH0 (%)</label>
+                      <input
+                        type="number"
+                        className="input-field w-full text-sm"
+                        value={calibrationParams.denseCh0}
+                        min={0}
+                        max={100}
+                        onChange={(e) => setCalibrationParams(p => ({ ...p, denseCh0: parseInt(e.target.value) || 0 }))}
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-purple-300 text-xs mb-1">Duration Base (ms)</label>
+                      <input
+                        type="number"
+                        className="input-field w-full text-sm"
+                        value={calibrationParams.denseDuration}
+                        min={100}
+                        max={10000}
+                        onChange={(e) => setCalibrationParams(p => ({ ...p, denseDuration: parseInt(e.target.value) || 100 }))}
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-purple-300 text-xs mb-1">Resistance Factor</label>
+                      <input
+                        type="number"
+                        className="input-field w-full text-sm"
+                        value={calibrationParams.denseResistance}
+                        min={0}
+                        max={1}
+                        step={0.001}
+                        onChange={(e) => setCalibrationParams(p => ({ ...p, denseResistance: parseFloat(e.target.value) || 0 }))}
+                      />
+                    </div>
+                  </div>
+                </div>
+                <div>
+                  <h5 className="text-purple-200 text-sm font-medium mb-2">Sparse (Level 1)</h5>
+                  <div className="space-y-2">
+                    <div>
+                      <label className="block text-purple-300 text-xs mb-1">CH0 (%)</label>
+                      <input
+                        type="number"
+                        className="input-field w-full text-sm"
+                        value={calibrationParams.sparseCh0}
+                        min={0}
+                        max={100}
+                        onChange={(e) => setCalibrationParams(p => ({ ...p, sparseCh0: parseInt(e.target.value) || 0 }))}
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-purple-300 text-xs mb-1">Duration Base (ms)</label>
+                      <input
+                        type="number"
+                        className="input-field w-full text-sm"
+                        value={calibrationParams.sparseDuration}
+                        min={100}
+                        max={10000}
+                        onChange={(e) => setCalibrationParams(p => ({ ...p, sparseDuration: parseInt(e.target.value) || 100 }))}
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-purple-300 text-xs mb-1">Resistance Factor</label>
+                      <input
+                        type="number"
+                        className="input-field w-full text-sm"
+                        value={calibrationParams.sparseResistance}
+                        min={0}
+                        max={1}
+                        step={0.001}
+                        onChange={(e) => setCalibrationParams(p => ({ ...p, sparseResistance: parseFloat(e.target.value) || 0 }))}
+                      />
+                    </div>
+                  </div>
+                </div>
+              </div>
+              <div className="mt-4 grid grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-purple-300 text-xs mb-1">CH1 (%) - Common</label>
+                  <input
+                    type="number"
+                    className="input-field w-full text-sm"
+                    value={calibrationParams.ch1}
+                    min={0}
+                    max={100}
+                    onChange={(e) => setCalibrationParams(p => ({ ...p, ch1: parseInt(e.target.value) || 0 }))}
+                  />
+                </div>
+                <div>
+                  <label className="block text-purple-300 text-xs mb-1">Feed Speed (mm/s)</label>
+                  <input
+                    type="number"
+                    className="input-field w-full text-sm"
+                    value={calibrationParams.feedSpeed}
+                    min={0.1}
+                    max={100}
+                    step={0.1}
+                    onChange={(e) => setCalibrationParams(p => ({ ...p, feedSpeed: parseFloat(e.target.value) || 0.1 }))}
+                  />
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Segment Editor Panel */}
+          {manualSelectedIdx >= 0 && manualSegments[manualSelectedIdx] && (
+            <div className="mb-4 p-4 bg-white/5 rounded-lg border border-white/10">
+              <h4 className="text-white/90 font-medium mb-3">Edit Segment {manualSelectedIdx + 1}</h4>
+
+              {/* Position Controls */}
+              <div className="mb-4">
+                <div className="mb-3">
+                  <label className="block text-white/70 text-sm mb-2">Start Position</label>
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="number"
+                      className="input-field w-24 text-center"
+                      value={manualSegments[manualSelectedIdx].startCm}
+                      min={0}
+                      max={manualTubeLengthCm}
+                      step={snapToGrid ? 1 : 0.1}
+                      onFocus={() => setIsEditingNumeric(true)}
+                      onBlur={(e) => {
+                        setIsEditingNumeric(false);
+                        if (e.target.value === '') {
+                          setManualSegments(arr => arr.map((seg, i) =>
+                            i === manualSelectedIdx ? { ...seg, startCm: 0 } : seg
+                          ));
+                        }
+                      }}
+                      onChange={(e) => {
+                        const value = e.target.value;
+                        if (value === '') return;
+                        const numValue = parseFloat(value);
+                        if (!isNaN(numValue)) {
+                          const currentEnd = manualSegments[manualSelectedIdx].endCm;
+                          const minGap = snapToGrid ? 1 : 0.1;
+                          const clampedStart = Math.min(numValue, currentEnd - minGap);
+
+                          // 重複チェック
+                          const newSegment = {
+                            startCm: clampedStart,
+                            endCm: currentEnd,
+                            densityLevel: manualSegments[manualSelectedIdx].densityLevel
+                          };
+                          const hasOverlap = manualSegments.some((seg, i) =>
+                            i !== manualSelectedIdx && segmentsOverlap(newSegment, seg)
+                          );
+
+                          if (!hasOverlap) {
+                            setManualSegments(arr => arr.map((seg, i) =>
+                              i === manualSelectedIdx ? { ...seg, startCm: clampedStart } : seg
+                            ));
+                          }
+                        }
+                      }}
+                    />
+                    <span className="text-white/40 text-sm">cm</span>
+                  </div>
+                </div>
+
+                <div className="mb-3">
+                  <label className="block text-white/70 text-sm mb-2">End Position</label>
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="number"
+                      className="input-field w-24 text-center"
+                      value={manualSegments[manualSelectedIdx].endCm}
+                      min={manualSegments[manualSelectedIdx].startCm + (snapToGrid ? 1 : 0.1)}
+                      max={manualTubeLengthCm}
+                      step={snapToGrid ? 1 : 0.1}
+                      onFocus={() => setIsEditingNumeric(true)}
+                      onBlur={(e) => {
+                        setIsEditingNumeric(false);
+                        if (e.target.value === '') {
+                          const currentStart = manualSegments[manualSelectedIdx].startCm;
+                          const minGap = snapToGrid ? 1 : 0.1;
+                          setManualSegments(arr => arr.map((seg, i) =>
+                            i === manualSelectedIdx ? { ...seg, endCm: currentStart + minGap } : seg
+                          ));
+                        }
+                      }}
+                      onChange={(e) => {
+                        const value = e.target.value;
+                        if (value === '') return;
+                        const numValue = parseFloat(value);
+                        if (!isNaN(numValue)) {
+                          const currentStart = manualSegments[manualSelectedIdx].startCm;
+                          const minGap = snapToGrid ? 1 : 0.1;
+                          // Tube Lengthを超えないように制限
+                          const maxEnd = manualTubeLengthCm;
+                          const clampedEnd = Math.min(
+                            Math.max(numValue, currentStart + minGap),
+                            maxEnd
+                          );
+
+                          // 重複チェック
+                          const newSegment = {
+                            startCm: currentStart,
+                            endCm: clampedEnd,
+                            densityLevel: manualSegments[manualSelectedIdx].densityLevel
+                          };
+                          const hasOverlap = manualSegments.some((seg, i) =>
+                            i !== manualSelectedIdx && segmentsOverlap(newSegment, seg)
+                          );
+
+                          if (!hasOverlap) {
+                            setManualSegments(arr => arr.map((seg, i) =>
+                              i === manualSelectedIdx ? { ...seg, endCm: clampedEnd } : seg
+                            ));
+                          }
+                        }
+                      }}
+                    />
+                    <span className="text-white/40 text-sm">cm</span>
+                  </div>
+                </div>
+
+                <div className="text-center text-white/60 text-sm">
+                  Length: {(manualSegments[manualSelectedIdx].endCm - manualSegments[manualSelectedIdx].startCm).toFixed(snapToGrid ? 0 : 1)}cm
+                </div>
+              </div>
+
+              {/* Density and Actions */}
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-white/70 text-sm mb-2">Density Level: {manualSegments[manualSelectedIdx].densityLevel}</label>
+                  <input
+                    type="range"
+                    className="w-full h-2 bg-white/20 rounded-lg appearance-none cursor-pointer"
+                    min={1}
+                    max={10}
+                    step={1}
+                    value={manualSegments[manualSelectedIdx].densityLevel}
+                    onChange={(e) => {
+                      const newLevel = parseInt(e.target.value);
+                      setManualSegments(arr => arr.map((seg, i) =>
+                        i === manualSelectedIdx ? { ...seg, densityLevel: newLevel } : seg
+                      ));
+                    }}
+                  />
+                  <div className="flex justify-between text-xs text-white/50 mt-1">
+                    <span>1 (Sparse)</span>
+                    <span>10 (Dense)</span>
+                  </div>
+                </div>
+
+                <div className="flex items-end justify-end">
+                  <button
+                    className="px-4 py-2 bg-red-600 hover:bg-red-700 text-white text-sm rounded"
+                    onClick={() => {
+                      setManualSegments(arr => arr.filter((_, i) => i !== manualSelectedIdx));
+                      setManualSelectedIdx(-1);
+                    }}
+                  >
+                    Delete Segment
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          <div className="relative overflow-x-auto border border-white/10 rounded-lg">
+            <div className="inline-block">
+              <canvas
+                ref={manualEditorRef}
+                className="h-24 bg-black select-none"
+                style={{ touchAction: 'none', minWidth: '100%' }}
+                onPointerDown={onManualPointerDown}
+                onPointerMove={onManualPointerMove}
+                onPointerUp={onManualPointerUp}
+                onContextMenu={onManualContextMenu}
+              />
+            </div>
+          </div>
+
+          {/* Export and Validation */}
+          {useManualSchedule && (
+            <div className="mt-4 flex items-center justify-between">
+              <div className="flex items-center gap-4">
+                <button
+                  onClick={() => {
+                    const exportData = {
+                      tubeLengthCm: manualTubeLengthCm,
+                      segments: manualSegments,
+                      ehdSteps: segmentsToEHDSteps(manualSegments, calibrationParams.feedSpeed, 50, calibrationParams),
+                      calibration: calibrationParams,
+                      timestamp: new Date().toISOString()
+                    };
+
+                    const blob = new Blob([JSON.stringify(exportData, null, 2)], { type: 'application/json' });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = `tubedrop-pattern-${new Date().toISOString().slice(0, 19).replace(/:/g, '-')}.json`;
+                    document.body.appendChild(a);
+                    a.click();
+                    document.body.removeChild(a);
+                    URL.revokeObjectURL(url);
+
+                    appendLog(`Exported pattern with ${manualSegments.length} segments`);
+                  }}
+                  className="px-4 py-2 bg-green-600/60 text-green-100 border border-green-400/40 hover:bg-green-600/80 text-sm rounded"
+                >
+                  Export JSON
+                </button>
+
+                <div className="text-white/60 text-sm">
+                  {manualSegments.length} segments → {segmentsToEHDSteps(manualSegments, calibrationParams.feedSpeed, 50, calibrationParams).length} steps
+                </div>
+              </div>
+
+              <div className="text-white/40 text-xs">
+                Feed Speed: {calibrationParams.feedSpeed}mm/s
+              </div>
+            </div>
+          )}
         </section>
 
         {/* Offscreen */}
