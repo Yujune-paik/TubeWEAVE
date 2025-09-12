@@ -1,0 +1,38 @@
+{
+  "tubeLengthCm": 71,
+  "segments": [
+    {
+      "startCm": 4,
+      "endCm": 68,
+      "densityLevel": 7
+    }
+  ],
+  "ehdSteps": [
+    {
+      "ch0": 0,
+      "ch1": 70,
+      "duration": 1000
+    },
+    {
+      "ch0": 78,
+      "ch1": 70,
+      "duration": 8000
+    },
+    {
+      "ch0": 0,
+      "ch1": 70,
+      "duration": 1000
+    }
+  ],
+  "calibration": {
+    "denseCh0": 80,
+    "denseDuration": 1500,
+    "denseResistance": 0.135,
+    "sparseCh0": 73,
+    "sparseDuration": 2000,
+    "sparseResistance": 0.05,
+    "ch1": 70,
+    "feedSpeed": 80
+  },
+  "timestamp": "2025-09-11T21:12:02.605Z"
+}

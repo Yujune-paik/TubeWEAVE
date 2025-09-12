@@ -1,11 +1,22 @@
 {
-  "tubeLengthCm": 10,
-  "segments": [],
+  "tubeLengthCm": 75,
+  "segments": [
+    {
+      "startCm": 10,
+      "endCm": 75,
+      "densityLevel": 7
+    }
+  ],
   "ehdSteps": [
     {
       "ch0": 0,
       "ch1": 70,
       "duration": 1250
+    },
+    {
+      "ch0": 78,
+      "ch1": 70,
+      "duration": 8125
     }
   ],
   "calibration": {
@@ -18,5 +29,5 @@
     "ch1": 70,
     "feedSpeed": 80
   },
-  "timestamp": "2025-09-11T19:48:48.760Z"
+  "timestamp": "2025-09-11T21:02:10.562Z"
 }

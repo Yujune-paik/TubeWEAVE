@@ -1,11 +1,11 @@
 {
-  "tubeLengthCm": 10,
+  "tubeLengthCm": 15,
   "segments": [],
   "ehdSteps": [
     {
       "ch0": 0,
       "ch1": 70,
-      "duration": 1250
+      "duration": 1500
     }
   ],
   "calibration": {
@@ -18,5 +18,5 @@
     "ch1": 70,
     "feedSpeed": 80
   },
-  "timestamp": "2025-09-11T19:48:48.760Z"
+  "timestamp": "2025-09-11T19:52:33.258Z"
 }

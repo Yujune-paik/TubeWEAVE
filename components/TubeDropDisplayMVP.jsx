@@ -63,33 +63,58 @@ const densityLevelToEHDParams = (densityLevel, calibration = null) => {
 };
 
 // Convert segments to EHD steps with resistance accumulation
-const segmentsToEHDSteps = (segments, feedSpeedMmPerSec = 10, maxSteps = 50, calibration = null) => {
-  if (!segments || segments.length === 0) return [];
+const segmentsToEHDSteps = (segments, feedSpeedMmPerSec = 10, maxSteps = 50, calibration = null, tubeLengthCm = 30) => {
+  if (!segments || segments.length === 0) {
+    // No segments: return single step covering entire tube with ch0=0, ch1=70, duration=1000
+    return [{
+      ch0: 0,
+      ch1: 70,
+      duration: 1500
+    }];
+  }
 
   // Sort segments by start position
   const sortedSegments = [...segments].sort((a, b) => a.startCm - b.startCm);
-
-  let cumulativeResistance = 0;
   const steps = [];
+  let currentPos = 0;
 
   for (let i = 0; i < sortedSegments.length && steps.length < maxSteps; i++) {
     const seg = sortedSegments[i];
-    const ehdParams = densityLevelToEHDParams(seg.densityLevel, calibration);
 
-    // Calculate duration based on segment length and feed speed
+    // Add gap step if there's a gap before this segment
+    if (seg.startCm > currentPos) {
+      const gapLengthCm = seg.startCm - currentPos;
+      const gapDurationMs = Math.round((gapLengthCm * 10 / feedSpeedMmPerSec) * 1000);
+      steps.push({
+        ch0: 0,
+        ch1: 70,
+        duration: Math.max(1000, gapDurationMs) // minimum 1000ms for gaps
+      });
+    }
+
+    // Add segment step
+    const ehdParams = densityLevelToEHDParams(seg.densityLevel, calibration);
     const segmentLengthMm = (seg.endCm - seg.startCm) * 10; // cm to mm
     const baseDurationMs = (segmentLengthMm / feedSpeedMmPerSec) * 1000;
-
-    // Apply resistance accumulation (like original Processing code)
-    const adjustedDuration = Math.round(baseDurationMs * (1 + cumulativeResistance));
-
-    // Add resistance factor to cumulative sum
-    cumulativeResistance += ehdParams.resistance_factor;
+    const adjustedDuration = Math.round(baseDurationMs);
 
     steps.push({
       ch0: ehdParams.ch0,
       ch1: ehdParams.ch1,
-      duration: adjustedDuration
+      duration: Math.max(1000, adjustedDuration) // minimum 1000ms
+    });
+
+    currentPos = seg.endCm;
+  }
+
+  // Add final gap if there's space after the last segment
+  if (currentPos < tubeLengthCm) {
+    const gapLengthCm = tubeLengthCm - currentPos;
+    const gapDurationMs = Math.round((gapLengthCm * 10 / feedSpeedMmPerSec) * 1000);
+    steps.push({
+      ch0: 0,
+      ch1: 70,
+      duration: Math.max(1000, gapDurationMs) // minimum 1000ms for gaps
     });
   }
 
@@ -839,7 +864,7 @@ export default function TubeDropDisplayMVP() {
     }
 
     // Convert manual segments to EHD steps
-    const steps = segmentsToEHDSteps(manualSegments, calibrationParams.feedSpeed, 50, calibrationParams);
+    const steps = segmentsToEHDSteps(manualSegments, calibrationParams.feedSpeed, 50, calibrationParams, manualTubeLengthCm);
     if (steps.length === 0) {
       appendLog("No valid segments to send");
       return false;
@@ -1753,55 +1778,53 @@ export default function TubeDropDisplayMVP() {
       ctx.fillStyle = "#1a1a1a";
       ctx.fillRect(margin, tubeY - tubeHeight / 2, tubeWidth, tubeHeight);
 
-      // Draw droplets along the tube synchronized with display result
-      if (dropSchedule && dropSchedule.length > 0 && fSignal && gSignal && fSignal.length > 0 && gSignal.length > 0) {
-        for (let i = 0; i < dropSchedule.length; i++) {
-          const drop = dropSchedule[i];
-          if (!drop || typeof drop.s_px !== 'number') continue;
+        // Draw droplets along the tube synchronized with display result
+        if (fSignal && gSignal && fSignal.length > 0 && gSignal.length > 0) {
+          // Sample along the path to create droplets based on f/g signals
+          const sampleStep = Math.max(1, Math.floor(totalLength / 200)); // Sample every few pixels
+          for (let s = 0; s < totalLength; s += sampleStep) {
+            const sampleIndex = Math.max(0, Math.min(fSignal.length - 1, Math.round(s / sampleStepPx)));
+            const fVal = (fSignal[sampleIndex] !== undefined) ? fSignal[sampleIndex] : 0; // target density [0,1]
+            const gVal = (gSignal[sampleIndex] !== undefined) ? gSignal[sampleIndex] : 0; // synthesized [0,1]
 
-          const x = margin + drop.s_px * scale; // straight mapping by arc-length
+            // Decide visibility by mode
+            let visible = false;
+            let alpha = 0;
+            let size = 0;
+            if (mode === "PWM") {
+              // PWM: presence when width > min => gVal > 0
+              visible = gVal > 0.001;
+              alpha = Math.max(0.15, Math.min(1, gVal));
+              size = 3 + 3 * gVal;
+            } else if (mode === "AM") {
+              // AM: amplitude encodes density
+              visible = fVal > 0.001;
+              alpha = Math.max(0.15, Math.min(1, gVal));
+              size = 2 + 4 * gVal;
+            } else if (mode === "DITHER") {
+              // Dither: only show if quantized on (gVal ~ 1 at some samples)
+              visible = gVal >= threshold;
+              alpha = visible ? 0.8 : 0;
+              size = visible ? 3.5 : 0;
+            }
 
-          // Find corresponding index on f/g signals with bounds checking
-          const sampleIndex = Math.max(0, Math.min(fSignal.length - 1, Math.round(drop.s_px / sampleStepPx)));
-          const fVal = (fSignal[sampleIndex] !== undefined) ? fSignal[sampleIndex] : 0; // target density [0,1]
-          const gVal = (gSignal[sampleIndex] !== undefined) ? gSignal[sampleIndex] : 0; // synthesized [0,1]
+            if (!visible) continue;
 
-          // Decide visibility by mode
-          let visible = false;
-          let alpha = 0;
-          let size = 0;
-          if (mode === "PWM") {
-            // PWM: presence when width > min => gVal > 0
-            visible = gVal > 0.001;
-            alpha = Math.max(0.15, Math.min(1, gVal));
-            size = 3 + 3 * gVal;
-          } else if (mode === "AM") {
-            // AM: amplitude encodes density
-            visible = fVal > 0.001;
-            alpha = Math.max(0.15, Math.min(1, gVal));
-            size = 2 + 4 * gVal;
-          } else if (mode === "DITHER") {
-            // Dither: only show if quantized on (gVal ~ 1 at some samples)
-            visible = gVal >= threshold;
-            alpha = visible ? 0.8 : 0;
-            size = visible ? 3.5 : 0;
+            // Clamp sizes
+            size = Math.max(1.5, Math.min(6, size));
+
+            const x = margin + s * scale; // straight mapping by arc-length
+
+            // Draw droplet (no glow to avoid filling look)
+            ctx.save();
+            ctx.globalAlpha = alpha;
+            ctx.fillStyle = "#00bfff";
+            ctx.beginPath();
+            ctx.arc(x, tubeY, size, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.restore();
           }
-
-          if (!visible) continue;
-
-          // Clamp sizes
-          size = Math.max(1.5, Math.min(6, size));
-
-          // Draw droplet (no glow to avoid filling look)
-          ctx.save();
-          ctx.globalAlpha = alpha;
-          ctx.fillStyle = "#00bfff";
-          ctx.beginPath();
-          ctx.arc(x, tubeY, size, 0, Math.PI * 2);
-          ctx.fill();
-          ctx.restore();
         }
-      }
 
       // Draw start and end markers
       ctx.fillStyle = "#10b981"; // green for start
@@ -1828,17 +1851,17 @@ export default function TubeDropDisplayMVP() {
       ctx.font = "10px monospace";
       ctx.textAlign = "left";
       ctx.fillText(`Length: ${totalLength.toFixed(1)}px`, margin, 20);
-      ctx.fillText(`Droplets: ${dropSchedule ? dropSchedule.length : 0}`, margin, 35);
+      ctx.fillText(`Samples: ${fSignal ? fSignal.length : 0}`, margin, 35);
       ctx.fillText(`Canvas: ${finalWidth.toFixed(0)}px wide`, margin, 50);
 
       // Debug info
-      if (dropSchedule && dropSchedule.length > 0) {
-        const firstDrop = dropSchedule[0];
-        const lastDrop = dropSchedule[dropSchedule.length - 1];
-        if (firstDrop && lastDrop && typeof firstDrop.s_px === 'number' && typeof lastDrop.s_px === 'number') {
-          ctx.fillText(`First: s=${firstDrop.s_px.toFixed(1)}px, amp=${(firstDrop.amplitude || 0).toFixed(2)}`, margin, 65);
-          ctx.fillText(`Last: s=${lastDrop.s_px.toFixed(1)}px, amp=${(lastDrop.amplitude || 0).toFixed(2)}`, margin, 80);
-        }
+      if (fSignal && fSignal.length > 0) {
+        const firstF = fSignal[0];
+        const lastF = fSignal[fSignal.length - 1];
+        const firstG = gSignal ? gSignal[0] : 0;
+        const lastG = gSignal ? gSignal[gSignal.length - 1] : 0;
+        ctx.fillText(`First: f=${firstF.toFixed(2)}, g=${firstG.toFixed(2)}`, margin, 65);
+        ctx.fillText(`Last: f=${lastF.toFixed(2)}, g=${lastG.toFixed(2)}`, margin, 80);
       }
     } else {
       // Show message when no content or path
@@ -2471,7 +2494,7 @@ export default function TubeDropDisplayMVP() {
   const buildStepsFromSegments = (json) => {
     try {
       const segs = Array.isArray(json?.segments) ? json.segments : [];
-      if (segs.length === 0) return [];
+      const tubeLength = Number.isFinite(json?.tubeLengthCm) ? json.tubeLengthCm : 30;
       const calib = json?.calibration || calibrationParams;
       const feed = Number.isFinite(calib?.feedSpeed) ? calib.feedSpeed : calibrationParams.feedSpeed;
       const steps = segmentsToEHDSteps(segs, feed, 100, {
@@ -2483,7 +2506,7 @@ export default function TubeDropDisplayMVP() {
         sparseResistance: calib?.sparseResistance ?? calibrationParams.sparseResistance,
         ch1: calib?.ch1 ?? calibrationParams.ch1,
         feedSpeed: feed,
-      });
+      }, tubeLength);
       return steps;
     } catch (_) {
       return [];
@@ -3718,7 +3741,7 @@ export default function TubeDropDisplayMVP() {
                     const exportData = {
                       tubeLengthCm: manualTubeLengthCm,
                       segments: manualSegments,
-                      ehdSteps: segmentsToEHDSteps(manualSegments, calibrationParams.feedSpeed, 50, calibrationParams),
+                      ehdSteps: segmentsToEHDSteps(manualSegments, calibrationParams.feedSpeed, 50, calibrationParams, manualTubeLengthCm),
                       calibration: calibrationParams,
                       timestamp: new Date().toISOString()
                     };
@@ -3741,7 +3764,7 @@ export default function TubeDropDisplayMVP() {
                 </button>
 
                 <div className="text-white/60 text-sm">
-                  {manualSegments.length} segments → {segmentsToEHDSteps(manualSegments, calibrationParams.feedSpeed, 50, calibrationParams).length} steps
+                  {manualSegments.length} segments → {segmentsToEHDSteps(manualSegments, calibrationParams.feedSpeed, 50, calibrationParams, manualTubeLengthCm).length} steps
                 </div>
               </div>
 
